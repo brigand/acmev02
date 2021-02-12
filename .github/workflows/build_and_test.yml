@@ -1,0 +1,18 @@
+on: [push]
+name: Build and test
+jobs:
+  build_and_test:
+    name: Build and test acme-client
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v2
+      - name: Install Rust nightly toolset
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+      - name: Build source code
+        run: cargo build --all-features
+      - name: Run tests
+        run: cargo test
