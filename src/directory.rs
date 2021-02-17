@@ -235,6 +235,7 @@ fn get_nonce_from_response(response: &reqwest::Response) -> Result<String> {
 mod tests {
     use ctor::ctor;
     use env_logger;
+    use log::debug;
     use openssl::{
         ec::EcKey,
     };
@@ -266,6 +267,6 @@ ac60quSOvQ7LOE+veCN0qqdsxTA+q+0MxA==
         };
 
         let account = dir.new_account(&req).await.unwrap();
-        println!("Account: {:#?}", account);
+        debug!("Account: {:#?}", account);
     }
 }
