@@ -38,7 +38,7 @@ pub struct AcmeAccount {
 
     /// Additional fields present that are not definied by RFC 8555.
     #[serde(flatten)]
-    pub additional_fields: HashMap<String, Value>,    
+    pub additional_fields: HashMap<String, Value>,
 }
 
 /// ACMEv02 account creation/lookup request.

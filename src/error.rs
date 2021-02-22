@@ -16,10 +16,11 @@ pub enum Error {
     OpenSslError(openssl::error::ErrorStack),
     ReqwestError(reqwest::Error),
     SerdeJsonError(serde_json::error::Error),
+    ChallengeTypeNotApplicable(String),
     InvalidAcmeServerResponse(String),
     InvalidAsn1Data(String),
     InvalidECKey(String),
-//    InvalidPayload(String),
+    MissingToken(String),
     Unimplemented(String),
 }
 
@@ -28,17 +29,21 @@ impl Error {
         Self::InvalidAsn1Data(msg.into())
     }
 
-    pub(crate) fn new_invalid_acme_server_response<T: Into<String>>(msg: T) -> Self {
+    pub(crate) fn invalid_acme_server_response<T: Into<String>>(msg: T) -> Self {
         Self::InvalidAcmeServerResponse(msg.into())
     }
 
-    pub(crate) fn new_invalid_ec_key<T: Into<String>>(msg: T) -> Self {
+    pub(crate) fn challenge_type_not_applicable<T: Into<String>>(msg: T) -> Self {
+        Self::ChallengeTypeNotApplicable(msg.into())
+    }
+
+    pub(crate) fn invalid_ec_key<T: Into<String>>(msg: T) -> Self {
         Self::InvalidECKey(msg.into())
     }
 
-    // pub(crate) fn new_invalid_payload<T: Into<String>>(msg: T) -> Self {
-    //     Self::InvalidPayload(msg.into())
-    // }
+    pub(crate) fn missing_token<T: Into<String>>(msg: T) -> Self {
+        Self::MissingToken(msg.into())
+    }
 
     #[allow(dead_code)]
     pub(crate) fn unimplemented<T: Into<String>>(msg: T) -> Self {
@@ -89,10 +94,11 @@ impl Display for Error {
             Self::OpenSslError(err) => write!(f, "acmev02::error::Error::OpenSslError({:#})", err),
             Self::ReqwestError(err) => write!(f, "acmev02::error::Error::ReqwestError({:#})", err),
             Self::SerdeJsonError(err) => write!(f, "acmev02::error::Error::SerdeJsonError({:#}", err),
+            Self::ChallengeTypeNotApplicable(msg) => write!(f, "acmev02::error::Error::ChallengeTypeNotApplicable({:#})", msg),
             Self::InvalidAcmeServerResponse(msg) => write!(f, "acmev02::error::Error::InvalidAcmeServerResponse({:#})", msg),
             Self::InvalidAsn1Data(msg) => write!(f, "acmev02::error::Error::InvalidAsn1Data({:#})", msg),
             Self::InvalidECKey(msg) => write!(f, "acmev02::error::Error::InvalidECKey({:#})", msg),
-            // Self::InvalidPayload(msg) => write!(f, "acmev02::error::Error::InvalidPayload({:#})", msg),
+            Self::MissingToken(msg) => write!(f, "acmev02::error::Error::MissingToken({:#})", msg),
             Self::Unimplemented(msg) => write!(f, "acmev02::error::Error::Unimplemented({:#})", msg),
         }
     }

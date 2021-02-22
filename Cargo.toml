@@ -28,5 +28,11 @@ simple_asn1 = "0.5"
 tokio = { version = "1.2", features = ["fs", "macros", "net", "rt", "sync"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 env_logger = "0.8"
 ctor = "0.1"
+lazy_static = "1.4"
+rand = { version = "0.8", features = ["std_rng"] }
+rusoto_core = "0.46"
+rusoto_credential = "0.46"
+rusoto_route53 = { version = "0.46" }

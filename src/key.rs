@@ -10,12 +10,200 @@ use openssl::{
     nid::Nid,
     pkey::{PKey, Private},
     rsa::Rsa,
+    sha::sha256,
     sign::Signer,
 };
-use serde_json::{Value, to_value};
+use serde_json::{Value, to_string, to_value};
 use simple_asn1::{ASN1Block, from_der};
 use crate::error::{Error, Result};
 use crate::helper::b64;
+
+#[derive(Clone, Debug)]
+pub enum KeyAlg {
+    /// An ED25519 keypair; algorithm (P-256/P-384/P-512) is determined by curve used.
+    Ed25519(EcKey<Private>),
+
+    /// An RSA keypair using RSASSA-PKCS1-v1_5 using SHA-256
+    RsaSha256(Rsa<Private>),
+}
+
+impl KeyAlg {
+    /// Returns the JWS header for the public portion of the key.
+    /// 
+    /// If `key_id` is specified, it is inserted into the header instead of the specific values for the key. The JWS
+    /// algorithm (`alg`), `url`, and `nonce` values are still inserted.
+    /// 
+    /// Format of Elliptic Curve keys
+    /// ```json
+    /// {
+    ///     "alg": "P-256",  (or "P-384"/"P-521")
+    ///     "url": "<url>",
+    ///     "nonce": "<nonce-value>",
+    ///     "kty": "EC",
+    ///     "crv": "P-256",
+    ///     "x": "<x-coordinate in base64url, big-endian>",
+    ///     "y": "<y-coordinate in base64url, big-endian>"
+    /// }
+    /// ```
+    /// 
+    /// /// Format of RSA keys, from [RFC 7517 §A.1](https://tools.ietf.org/html/rfc7517#appendix-A.1):
+    /// ```json
+    /// {
+    ///     "alg": "RS256",
+    ///     "url": "<url>",
+    ///     "nonce": "<nonce-value>",
+    ///     "kty": "RSA",
+    ///     "n": "<n/modulus in base64url, big-endian>",
+    ///     "e": "<e/exponent in base64url, big-endian>"
+    /// }
+    /// ```
+    pub fn get_header(&self, url: &str, nonce: &str, key_id: Option<&str>) -> Result<Value> {
+        match self {
+            Self::Ed25519(key) => {
+                let group = key.group();
+                let (alg, curve_name) = get_ec_alg_crv(group.curve_name())?;
+            
+                let pubkey = key.public_key();
+                let mut x = BigNum::new()?;
+                let mut y = BigNum::new()?;
+                let mut ctx = BigNumContext::new()?;
+                pubkey.affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)?;
+            
+                let mut header: HashMap<String, Value> = HashMap::new();
+                header.insert("alg".to_string(), to_value(alg)?);
+                header.insert("url".to_string(), to_value(url)?);
+                header.insert("nonce".to_string(), to_value(nonce)?);
+
+                match key_id {
+                    None => {
+                        let mut jwk: BTreeMap<String, String> = BTreeMap::new();
+                        jwk.insert("kty".to_string(), "EC".to_string());
+                        jwk.insert("crv".to_string(), curve_name.to_string());
+                        jwk.insert("x".to_string(), b64(&x.to_vec()));
+                        jwk.insert("y".to_string(), b64(&y.to_vec()));
+                    
+                        header.insert("jwk".to_string(), to_value(jwk)?);
+                    }
+                    Some(v) => {
+                        header.insert("kid".to_string(), to_value(v)?);
+                    }
+                }
+    
+                Ok(to_value(header)?)
+            },
+            Self::RsaSha256(key) => {
+                let mut header: HashMap<String, Value> = HashMap::new();
+                header.insert("alg".to_string(), to_value("RS256")?);
+                header.insert("url".to_string(), to_value(url)?);
+                header.insert("nonce".to_string(), to_value(nonce)?);
+
+                match key_id {
+                    None => {
+                        let mut jwk: BTreeMap<String, String> = BTreeMap::new();
+                        jwk.insert("kty".to_string(), "RSA".to_string());
+                        jwk.insert("e".to_string(), b64(key.e().to_vec()));
+                        jwk.insert("n".to_string(), b64(key.n().to_vec()));
+
+                        header.insert("jwk".to_string(), to_value(jwk)?);
+                    }
+                    Some(v) => {
+                        header.insert("kid".to_string(), to_value(v)?);
+                    }
+                }
+                Ok(to_value(header)?)
+            },
+        }
+    }
+
+    /// Signs the protected header and payload, producing a base64url signature.
+    pub fn get_signature(&self, protected_header: &str, payload: &str) -> Result<String> {
+        let string_to_sign = format!("{}.{}", protected_header, payload);
+        match self {
+            Self::Ed25519(key) => {
+                let pkey = PKey::from_ec_key(key.clone())?;
+                let mut signer = Signer::new(get_digest_for_ec_key(&key)?, &pkey)?;
+                let signature_der_bytes = signer.sign_oneshot_to_vec(string_to_sign.as_bytes())?;
+                let asn1_blocks = from_der(&signature_der_bytes)?;
+                let signature_bytes = der_sig_to_bytes(&asn1_blocks)?;
+                Ok(b64(signature_bytes))
+            }
+            Self::RsaSha256(key) => {
+                let pkey = PKey::from_rsa(key.clone())?;
+                let mut signer = Signer::new(MessageDigest::sha256(), &pkey)?;
+                signer.update(string_to_sign.as_bytes())?;
+                let signature_bytes = signer.sign_to_vec()?;
+                debug!(target: "acmev02", "Signature bytes length: {}", signature_bytes.len());
+                Ok(b64(signature_bytes))
+            }
+        }
+    }
+
+    /// Returns the JWK tumbprint value encoded in base64url for the key.
+    /// See [RFC 7638](https://tools.ietf.org/html/rfc7638) for details.
+    pub fn get_thumbprint_b64(&self) -> Result<String> {
+        let jwk: BTreeMap<&'static str, String> = match self {
+            Self::Ed25519(key) => {
+                let group = key.group();
+                let curve_name = get_ec_alg_crv(group.curve_name())?.1;
+
+                let pubkey = key.public_key();
+                let mut x = BigNum::new()?;
+                let mut y = BigNum::new()?;
+                let mut ctx = BigNumContext::new()?;
+                pubkey.affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)?;
+
+                let mut jwk = BTreeMap::new();
+                jwk.insert("crv", curve_name.to_string());
+                jwk.insert("kty", "EC".to_string());
+                jwk.insert("x", b64(&x.to_vec()));
+                jwk.insert("y", b64(&y.to_vec()));
+                jwk
+            }
+            Self::RsaSha256(key) => {
+                let mut jwk = BTreeMap::new();
+                jwk.insert("kty", "RSA".to_string());
+                jwk.insert("e", b64(key.e().to_vec()));
+                jwk.insert("n", b64(key.n().to_vec()));
+                jwk
+            }
+        };
+        let jwk_str = to_string(&to_value(jwk)?)?;
+        debug!("jwk_str: {}", jwk_str);
+        let jwk_sha = sha256(&jwk_str.as_bytes());
+        Ok(b64(jwk_sha))
+    }
+
+    /// Returns an ACMEv02 key authorization in the form: `<token>.<thumbprint_b64>`.
+    /// See [RFC 8555 §8.1](https://tools.ietf.org/html/rfc8555#section-8.1).
+    pub fn get_key_authorization(&self, token: &str) -> Result<String> {
+        Ok(format!("{}.{}", token, self.get_thumbprint_b64()?))
+    }
+}
+
+fn get_digest_for_ec_key(key: &EcKey<Private>) -> Result<MessageDigest> {
+    match key.group().curve_name() {
+        None => Err(Error::invalid_ec_key("EC key does not have an associated named curve")),
+        Some(nid) => match nid {
+            Nid::X9_62_PRIME256V1 => Ok(MessageDigest::sha256()),
+            Nid::SECP384R1 => Ok(MessageDigest::sha384()),
+            Nid::SECP521R1 => Ok(MessageDigest::sha512()),
+            _ => Err(Error::invalid_ec_key("EC key does not have a recognized EC curve")),
+        }
+    }
+}
+
+/// Return the JWK `alg` and `crv` values for a given elliptic curve.
+fn get_ec_alg_crv(curve_name: Option<Nid>) -> Result<(&'static str, &'static str)> {
+    match curve_name {
+        None => return Err(Error::invalid_ec_key("EC key does not have an associated named curve")),
+        Some(nid) => match nid {
+            Nid::X9_62_PRIME256V1 => Ok(("ES256", "P-256")),
+            Nid::SECP384R1 => Ok(("ES384", "P-384")),
+            Nid::SECP521R1 => Ok(("ES512", "P-521")),
+            _ => return Err(Error::invalid_ec_key("EC key does not have a recognized EC curve")),
+        }
+    }
+}
 
 fn der_sig_to_bytes(der_signature: &[ASN1Block]) -> Result<Vec<u8>> {
     if der_signature.len() == 1 {
@@ -57,114 +245,3 @@ fn der_sig_to_bytes(der_signature: &[ASN1Block]) -> Result<Vec<u8>> {
     }
 }
 
-pub enum KeyAlg {
-    /// An ED25519 keypair; algorithm (P-256/P-384/P-512) is determined by curve used.
-    Ed25519(EcKey<Private>),
-
-    /// An RSA keypair using RSASSA-PKCS1-v1_5 using SHA-256
-    RsaSha256(Rsa<Private>),
-}
-
-impl KeyAlg {
-    /// Format of Elliptic Curve keys, from [RFC 7517 §A.1](https://tools.ietf.org/html/rfc7517#appendix-A.1):
-    /// ```json
-    /// {
-    ///     "kty": "EC",
-    ///     "crv": "P-256",
-    ///     "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-    ///     "y": "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
-    /// }
-    /// ```
-    /// 
-    /// /// Format of RSA keys, from [RFC 7517 §A.1](https://tools.ietf.org/html/rfc7517#appendix-A.1):
-    /// ```json
-    /// {
-    ///     "kty": "RSA",
-    ///     "n": "0vx7agoebGc...FTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
-    ///     "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-    ///     "e": "AQAB"
-    /// }
-    /// ```
-    pub fn get_header(&self, url: &str, nonce: &str) -> Result<Value> {
-        match self {
-            Self::Ed25519(key) => {
-                let group = key.group();
-                let (alg, curve_name) = match group.curve_name() {
-                    None => return Err(Error::new_invalid_ec_key("EC key does not have an associated named curve")),
-                    Some(nid) => match nid {
-                        Nid::X9_62_PRIME256V1 => ("ES256", "P-256"),
-                        Nid::SECP384R1 => ("ES384", "P-384"),
-                        Nid::SECP521R1 => ("ES512", "P-521"),
-                        _ => return Err(Error::new_invalid_ec_key("EC key does not have a recognized EC curve")),
-                    }
-                };
-            
-                let pubkey = key.public_key();
-                let mut x = BigNum::new()?;
-                let mut y = BigNum::new()?;
-                let mut ctx = BigNumContext::new()?;
-                pubkey.affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)?;
-            
-                let mut jwk: BTreeMap<String, String> = BTreeMap::new();
-                jwk.insert("kty".to_owned(), "EC".to_owned());
-                jwk.insert("crv".to_owned(), curve_name.to_owned());
-                jwk.insert("x".to_owned(), b64(&x.to_vec()));
-                jwk.insert("y".to_owned(), b64(&y.to_vec()));
-            
-                let mut header: HashMap<String, Value> = HashMap::new();
-                header.insert("alg".to_owned(), to_value(alg)?);
-                header.insert("url".to_owned(), to_value(url)?);
-                header.insert("nonce".to_owned(), to_value(nonce)?);
-                header.insert("jwk".to_owned(), to_value(jwk)?);
-                Ok(to_value(header)?)
-            },
-            Self::RsaSha256(key) => {
-                let mut jwk: BTreeMap<String, String> = BTreeMap::new();
-                jwk.insert("kty".to_owned(), "RSA".to_owned());
-                jwk.insert("e".to_owned(), b64(key.e().to_vec()));
-                jwk.insert("n".to_owned(), b64(key.n().to_vec()));
-
-                let mut header: HashMap<String, Value> = HashMap::new();
-                header.insert("alg".to_owned(), to_value("RS256")?);
-                header.insert("url".to_owned(), to_value(url)?);
-                header.insert("nonce".to_owned(), to_value(nonce)?);
-                header.insert("jwk".to_owned(), to_value(jwk)?);
-                Ok(to_value(header)?)
-            },
-        }
-    }
-
-    pub fn get_signature(&self, protected_header: &str, payload: &str) -> Result<String> {
-        let string_to_sign = format!("{}.{}", protected_header, payload);
-        match self {
-            Self::Ed25519(key) => {
-                let pkey = PKey::from_ec_key(key.clone())?;
-                let mut signer = Signer::new(get_digest_for_ec_key(&key)?, &pkey)?;
-                let signature_der_bytes = signer.sign_oneshot_to_vec(string_to_sign.as_bytes())?;
-                let asn1_blocks = from_der(&signature_der_bytes)?;
-                let signature_bytes = der_sig_to_bytes(&asn1_blocks)?;
-                Ok(b64(signature_bytes))
-            }
-            Self::RsaSha256(key) => {
-                let pkey = PKey::from_rsa(key.clone())?;
-                let mut signer = Signer::new(MessageDigest::sha256(), &pkey)?;
-                signer.update(string_to_sign.as_bytes())?;
-                let signature_bytes = signer.sign_to_vec()?;
-                debug!(target: "acmev02", "Signature bytes length: {}", signature_bytes.len());
-                Ok(b64(signature_bytes))
-            }
-        }
-    }
-}
-
-fn get_digest_for_ec_key(key: &EcKey<Private>) -> Result<MessageDigest> {
-    match key.group().curve_name() {
-        None => Err(Error::new_invalid_ec_key("EC key does not have an associated named curve")),
-        Some(nid) => match nid {
-            Nid::X9_62_PRIME256V1 => Ok(MessageDigest::sha256()),
-            Nid::SECP384R1 => Ok(MessageDigest::sha384()),
-            Nid::SECP521R1 => Ok(MessageDigest::sha512()),
-            _ => Err(Error::new_invalid_ec_key("EC key does not have a recognized EC curve")),
-        }
-    }
-}

@@ -13,11 +13,18 @@ use serde::{
     self, Serialize, Deserialize,
     de::DeserializeOwned,
 };
-use serde_json::{Value, to_string, to_value};
-use crate::account::{AcmeAccount, AcmeAccountRequest};
-use crate::error::{Error, Result};
-use crate::helper::b64;
-use crate::key::KeyAlg;
+use serde_json::{
+    map::Map,
+    to_string, to_value, Value,
+};
+use crate::{
+    account::{AcmeAccount, AcmeAccountRequest},
+    authorization::{AcmeAuthorization, AcmeChallenge},
+    error::{Error, Result},
+    helper::b64,
+    key::KeyAlg,
+    order::{AcmeOrder, AcmeOrderRequest},
+};
 
 /// Default Let's Encrypt directory URL to configure client.
 pub const LETSENCRYPT_DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -127,20 +134,29 @@ impl AcmeDirectory {
         Ok(dir)
     }
 
-    pub async fn new_account(&mut self, request: &AcmeAccountRequest) -> Result<AcmeAccount> {
+    pub async fn login(self, request: &AcmeAccountRequest) -> Result<(AcmeBoundDirectory, AcmeAccount)> {
         let url = self.info.new_account.clone();
-        let (_, _, result) = self.request(&url, request).await?;
-        Ok(result)
+        let (headers, _, account) = self.request::<&AcmeAccountRequest, AcmeAccount>(&url, request, None).await?;
+        let location_header = headers.get("location");
+        match location_header {
+            None => Err(Error::invalid_acme_server_response("Location header not found")),
+            Some(value_unchecked) => {
+                match value_unchecked.to_str() {
+                    Ok(account_key_id) => Ok((AcmeBoundDirectory::new(self, account_key_id), account)),
+                    Err(_) => Err(Error::invalid_acme_server_response("Location header contains invalid characters"))
+                }
+            }
+        }
     }
 
     /// Make a new POST request to a URL, signed with the key.
     /// This returns the Headers, StatusCode and Value from the reply.
-    async fn request<T, V>(&mut self, url: &str, payload: T) -> Result<(HeaderMap, StatusCode, V)>
+    async fn request<T, V>(&self, url: &str, payload: T, key_id: Option<&str>) -> Result<(HeaderMap, StatusCode, V)>
         where
             T: Serialize,
             V: DeserializeOwned,
     {
-        let jws = self.create_jws_request_body(url, payload).await?;
+        let jws = self.create_jws_request_body(url, payload, key_id).await?;
         let jws_string = to_string(&jws)?;
         debug!(target: "acmev02", "jws: {:?}", jws_string);
         let client = Client::new();
@@ -177,11 +193,57 @@ impl AcmeDirectory {
 
         Ok((headers, status, value))
     }
-    
+
+    /// Make a new POST-as-GET request to a URL, signed with the key.
+    /// This returns the Headers, StatusCode and Value from the reply.
+    async fn request_get<V>(&self, url: &str, key_id: Option<&str>) -> Result<(HeaderMap, StatusCode, V)>
+    where
+        V: DeserializeOwned,
+    {
+        let jws = self.create_post_as_get_jws_request_body(url, key_id).await?;
+        let jws_string = to_string(&jws)?;
+        debug!(target: "acmev02", "jws: {:?}", jws_string);
+        let client = Client::new();
+        let request = client
+            .post(url)
+            .body(jws_string)
+            .header("content-type", "application/jose+json")
+            .build()?;
+        debug!(target: "acmev02", "request: {:?}", request);
+        
+        let response = client.execute(request).await?;
+
+        match get_nonce_from_response(&response) {
+            Ok(nonce) => {
+                // Save this nonce for future use.
+                let rc = self.next_nonce.lock().unwrap();
+                (*rc).replace(Some(nonce));
+            }
+            Err(_) => {
+                // Ignore this case.
+            }
+        }
+
+        let status = response.status();
+        if status.as_u16() >= 300 {
+            let err = response.error_for_status_ref().unwrap_err();
+            let text = response.text().await.unwrap_or("<unknown>".to_string());
+            error!(target: "acmev02", "Unexpected response from server: {} - {}", status.as_u16(), text);
+            return Err(Error::ReqwestError(err));
+        }
+
+        let headers = response.headers().clone();
+        let value = response.json::<V>().await?;
+
+        Ok((headers, status, value))
+    }
+
     //// Create the JWS request body for a given URL and payload.
-    async fn create_jws_request_body<T: Serialize>(&mut self, url: &str, payload: T) -> Result<Jws> {
+    async fn create_jws_request_body<T>(&self, url: &str, payload: T, key_id: Option<&str>) -> Result<Jws>
+        where T: Serialize
+    {
         let nonce = self.get_nonce().await?;
-        let header = self.key.get_header(url, &nonce)?;
+        let header = self.key.get_header(url, &nonce, key_id)?;
         let header64 = b64(to_string(&header)?.as_bytes());
 
         let payload_json = to_value(&payload)?;
@@ -192,13 +254,25 @@ impl AcmeDirectory {
         Ok(Jws{protected: header64, payload: payload64, signature: signature})
     }
 
+    //// Create the JWS request body for a given URL and empty payload for a POST-as-GET request.
+    async fn create_post_as_get_jws_request_body(&self, url: &str, key_id: Option<&str>) -> Result<Jws> {
+        let nonce = self.get_nonce().await?;
+        let header = self.key.get_header(url, &nonce, key_id)?;
+        let header64 = b64(to_string(&header)?.as_bytes());
+
+        let payload64 = "";       
+        let signature = self.key.get_signature(&header64, &payload64)?;
+
+        Ok(Jws{protected: header64, payload: payload64.to_string(), signature: signature})
+    }
+
     /// Returns a new anti-replay nonce value.
     /// 
     /// Each nonce value can be used only once. ACMEv02 attempts to pre-fill nonce values by including them in
     /// HTTP responses in the `Replay-Nonce` header and the AcmeDirectory instance caches this for use. If this cached
     /// value is availble, it is returned (and the cache voided). If the cached value is unavailable, a new nonce value
     /// is retreived from the remote server.
-    pub async fn get_nonce(&mut self) -> Result<String> {
+    pub async fn get_nonce(&self) -> Result<String> {
         let rc = self.next_nonce.lock().unwrap();
         let next_nonce = (*rc).replace(None);
         match next_nonce {
@@ -215,58 +289,69 @@ impl AcmeDirectory {
         get_nonce_from_response(&response)
     }
 }
+
+
+/// An ACMEv02 directory bound to an account. All requests are made against the account.
+pub struct AcmeBoundDirectory {
+    dir: AcmeDirectory,
+
+    /// The key_id to send in requests.
+    key_id: String,
+}
+
+impl AcmeBoundDirectory {
+    pub(crate) fn new<S: Into<String>>(dir: AcmeDirectory, key_id: S) -> Self {
+        Self { dir: dir, key_id: key_id.into() }
+    }
+
+    pub async fn new_order(&self, request: &AcmeOrderRequest) -> Result<AcmeOrder> {
+        let url = self.dir.info.new_order.clone();
+        let (_, _, result) = self.request(&url, request).await?;
+        Ok(result)
+    }
+
+    pub async fn get_authorization(&self, authorization_url: &str) -> Result<AcmeAuthorization> {
+        let (_, _, result) = self.request_get(authorization_url).await?;
+        Ok(result)
+    }
+
+    pub async fn respond_challenge(&self, url: &str) -> Result<AcmeChallenge> {
+        let payload = Value::Object(Map::<String, Value>::with_capacity(0));
+        let (_, _, result) = self.request(url, payload).await?;
+        Ok(result)
+    }
+
+    /// Make a new POST request to a URL, signed with the key and passing our key_id instead of the physical key.
+    /// This returns the Headers, StatusCode and Value from the reply.
+    async fn request<T, V>(&self, url: &str, payload: T) -> Result<(HeaderMap, StatusCode, V)>
+    where
+        T: Serialize,
+        V: DeserializeOwned
+    {
+        self.dir.request(url, payload, Some(&self.key_id)).await
+    }
+
+    /// Make a new POST-as-GET request to a URL, signed with the key and passing our key_id instead of the physical key.
+    /// This returns the Headers, StatusCode and Value from the reply.
+    async fn request_get<V>(&self, url: &str) -> Result<(HeaderMap, StatusCode, V)>
+    where
+        V: DeserializeOwned
+    {
+        self.dir.request_get(url, Some(&self.key_id)).await
+    }
+}
     
 /// Extracts the anti-replay nonce value from the HTTP header in a response.
 fn get_nonce_from_response(response: &reqwest::Response) -> Result<String> {
     let replay_nonce_header = response.headers().get("replay-nonce");
     match replay_nonce_header {
-        None => Err(Error::new_invalid_acme_server_response("Replay-Nonce header not found")),
+        None => Err(Error::invalid_acme_server_response("Replay-Nonce header not found")),
         Some(value_bytes) => {
             let value_str = value_bytes.to_str();
             match value_str {
                 Ok(nonce) => Ok(nonce.to_string()),
-                Err(_) => Err(Error::new_invalid_acme_server_response("Replay-Nonce header contains invalid characeters"))
+                Err(_) => Err(Error::invalid_acme_server_response("Replay-Nonce header contains invalid characeters"))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use ctor::ctor;
-    use env_logger;
-    use log::debug;
-    use openssl::{
-        ec::EcKey,
-    };
-    use crate::account::{AcmeAccountRequest};
-    use crate::key::KeyAlg;
-    use crate::directory::{AcmeDirectory, LETSENCRYPT_STAGING_DIRECTORY_URL};
-
-    const EC_KEY: &str = "-----BEGIN EC PRIVATE KEY-----
-MHcCAQEEIPSvFMWfG1r1oZjKUJlvK40DERj2P2Ipyx8peCCL8LguoAoGCCqGSM49
-AwEHoUQDQgAE6pzdhXYtfbboKyqGwSuU32UxpcQOmgAavjdmX58wpZ0j9MQ3i9YH
-ac60quSOvQ7LOE+veCN0qqdsxTA+q+0MxA==
------END EC PRIVATE KEY-----";
-
-    #[ctor]
-    fn init() {
-        env_logger::try_init().unwrap_or_else(|e| eprintln!("Failed to initialize env_logger: {:#}", e));
-    }
-
-    #[tokio::test]
-    async fn test_account_create() {
-        let eckey = EcKey::private_key_from_pem(EC_KEY.as_bytes()).unwrap();
-        let keyalg = KeyAlg::Ed25519(eckey);
-        let mut dir = AcmeDirectory::from_url(LETSENCRYPT_STAGING_DIRECTORY_URL, keyalg).await.unwrap();
-        let req = AcmeAccountRequest{
-            contact: Some(vec!["mailto:dacut+acmev02-library-test@kanga.org".to_string()]),
-            terms_of_service_agreed: Some(true),
-            external_account_binding: None,
-            only_return_existing: None,
-        };
-
-        let account = dir.new_account(&req).await.unwrap();
-        debug!("Account: {:#?}", account);
     }
 }
