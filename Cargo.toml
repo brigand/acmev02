@@ -1,8 +1,8 @@
 [package]
-name = "acmev02-library"
+name = "acmev02"
 edition = "2018"
 description = "ACME client library to issue, renew and revoke TLS certificates."
-version = "0.5.3"
+version = "0.6-pre"
 authors = ["David Cuthbert <dacut@kanga.org", "Onur Aslan <onur@onur.im>"]
 license = "MIT"
 keywords = ["letsencrypt", "acme"]

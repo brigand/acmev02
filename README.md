@@ -8,6 +8,10 @@
 Easy to use Let's Encrypt compatible ACME client to issue, renew and
 revoke TLS certificates.
 
+# Fork
+
+This fork of a fork is published as `acmev02`. Readme has not been otherwise updated yet. It upgrades reqwest which gets rid of the openssl 0.9 dep, which was breaking my rust-musl-builder builds.
+
 **Contents**
 
    * [CLI](#cli)
